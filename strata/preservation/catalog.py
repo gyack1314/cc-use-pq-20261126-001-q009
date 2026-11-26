@@ -120,8 +120,10 @@ class Catalog:
                 number = current["head"] + 1
                 connection.execute(
                     """INSERT INTO revisions(collection,number,deposit,parent,manifest_hash,manifest,
-                       published_at,retain_until) VALUES(?,?,?,?,?,?,?,?)""",
+                       changes,changes_hash,published_at,retain_until)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (collection, number, deposit, row["parent"], row["manifest_hash"], row["manifest"],
+                     row["changes"], row["changes_hash"],
                      now, now + current["retention_seconds"]),
                 )
                 parts = manifest.unique_parts()

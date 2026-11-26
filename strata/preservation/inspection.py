@@ -47,11 +47,13 @@ class Inspection:
             item = connection.execute("SELECT * FROM objects WHERE digest=?", (digest,)).fetchone()
             editions = self._edition_references(connection, digest, limit)
             deposits = self._deposit_references(connection, digest, limit)
-            if item is None and not editions["count"] and not deposits["count"]:
+            candidates = self._candidate_references(connection, digest, limit)
+            if item is None and not editions["count"] and not deposits["count"] \
+                    and not candidates["count"]:
                 raise missing("archive object", digest)
             return {
                 "digest": digest, "physical": dict(item) if item is not None else None,
-                "editions": editions, "deposits": deposits,
+                "editions": editions, "deposits": deposits, "candidates": candidates,
             }
 
     @staticmethod
@@ -83,6 +85,33 @@ class Inspection:
         examples = connection.execute(
             """SELECT d.id,d.collection,d.status,d.expires_at,p.received_at """ + source +
             " ORDER BY (p.digest IS NULL),d.id LIMIT ?", (digest, limit),
+        ).fetchall()
+        return {**dict(totals), "items": [dict(row) for row in examples]}
+
+    @staticmethod
+    def _candidate_references(connection: Connection, digest: str, limit: int) -> dict:
+        source = """
+            FROM candidates c
+            LEFT JOIN candidate_expected_parts e ON e.candidate=c.id AND e.digest=?
+            LEFT JOIN candidate_received_parts r ON r.candidate=c.id AND r.digest=?
+            LEFT JOIN candidate_dependencies d ON d.candidate=c.id AND d.digest=?
+            WHERE COALESCE(e.digest,r.digest,d.digest) IS NOT NULL
+        """
+        parameters = (digest, digest, digest)
+        totals = connection.execute(
+            f"""SELECT COUNT(*) AS count,
+                COALESCE(SUM(c.status='open'),0) AS protecting,
+                COALESCE(SUM(r.digest IS NOT NULL),0) AS received,
+                COALESCE(SUM(d.digest IS NOT NULL),0) AS dependencies,
+                COALESCE(SUM(e.digest IS NOT NULL AND r.digest IS NULL),0) AS awaiting
+                {source}""", parameters,
+        ).fetchone()
+        examples = connection.execute(
+            f"""SELECT c.id,c.collection,c.status,c.base_revision,c.expires_at,
+                (r.digest IS NOT NULL) AS received,(d.digest IS NOT NULL) AS dependency,
+                (e.digest IS NOT NULL AND r.digest IS NULL) AS awaiting
+                {source} ORDER BY c.status,c.expires_at,c.id LIMIT ?""",
+            (*parameters, limit),
         ).fetchall()
         return {**dict(totals), "items": [dict(row) for row in examples]}
 

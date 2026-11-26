@@ -62,9 +62,13 @@ class Accepted:
     revision: int | None
     transmitted: int
 
+    @property
+    def candidate(self) -> str:
+        return self.deposit
+
     def as_dict(self) -> dict:
-        return {"deposit": self.deposit, "status": self.status, "revision": self.revision,
-                "transmitted": self.transmitted}
+        return {"deposit": self.deposit, "candidate": self.deposit, "status": self.status,
+                "revision": self.revision, "transmitted": self.transmitted}
 
 
 class Uplink:
@@ -106,6 +110,50 @@ class Uplink:
                 or result.get("parent") != parcel.parent):
             raise unavailable("Publish receipt does not match the parcel", deposit=session)
         return Accepted(session, "published", self._revision(result), sent)
+
+    def send_candidate(self, parcel: Parcel, *, changes: list | None = None,
+                       maximum_parts: int | None = None,
+                       publish_merge: bool = False) -> "Accepted":
+        """把档案包作为有独立身份的更正候选接入并续传缺片。
+
+        重复调用使用同一 token，会回到同一候选并只补送仍缺的分片。默认
+        不发布合订版——冲突需要档案员复核；干净场景可显式 publish_merge。
+        """
+        expected = parcel.manifest.unique_parts()
+        if maximum_parts is not None and (type(maximum_parts) is not int or maximum_parts < 0):
+            raise invalid("Part limit must be a non-negative integer")
+        body = dict(parcel.collection_body)
+        if changes is not None:
+            body["changes"] = changes
+        reply = self.endpoint.request(
+            "POST", f"/collections/{parcel.collection}/candidates", json=body)
+        session, pending = self._accept_open(parcel, reply, expected)
+        if reply["status"] == "published":
+            return Accepted(session, "published", self._revision(reply), 0)
+        if reply["status"] != "open":
+            raise VaultError("candidate_closed", "Vault candidate no longer accepts this parcel",
+                             409, candidate=session, status=reply["status"])
+        remaining = pending if maximum_parts is None else pending[:maximum_parts]
+        media = parcel.media()
+        sent = 0
+        for digest in remaining:
+            size = expected[digest]
+            media.verify(digest, size)
+            with media.path(digest).open("rb") as stream:
+                result = self.endpoint.request(
+                    "PUT", f"/candidates/{session}/parts/{digest}",
+                    content=iter(lambda: stream.read(BLOCK_SIZE), b""),
+                    headers={"Content-Length": str(size),
+                             "Content-Type": "application/octet-stream"},
+                )
+            if (result.get("candidate", result.get("deposit")) != session
+                    or result.get("digest") != digest or result.get("size") != size):
+                raise unavailable("Receipt does not identify the transmitted part", digest=digest)
+            sent += 1
+        if publish_merge and (maximum_parts is None or len(remaining) == len(pending)):
+            result = self.endpoint.request("POST", f"/candidates/{session}/publish-merge", json={})
+            return Accepted(session, "published", self._revision(result), sent)
+        return Accepted(session, "open", None, sent)
 
     def _accept_open(self, parcel: Parcel, value: dict, expected: dict[str, int]) -> tuple[str, list[str]]:
         session = value.get("id")

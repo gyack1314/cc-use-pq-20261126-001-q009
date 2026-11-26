@@ -73,10 +73,24 @@ class Delivery:
 
     def _open_revision(self, connection, collection, number):
         row = revision_row(connection, collection, number)
-        if row["retired_at"] is not None:
+        manifest = parse_stored(row["manifest"], row["manifest_hash"])
+        if row["retired_at"] is not None and not self._protected_by_candidate(connection, manifest):
             raise VaultError("revision_retired", "Revision bytes have been retired", 410,
                              collection=collection, revision=number)
-        return row, parse_stored(row["manifest"], row["manifest_hash"])
+        return row, manifest
+
+    @staticmethod
+    def _protected_by_candidate(connection, manifest) -> bool:
+        """旧版虽已退役，但若仍有有效期内的候选依赖其全部分片，则继续可取回。"""
+        digests = set(manifest.unique_parts())
+        if not digests:
+            return False
+        marks = ",".join("?" for _ in digests)
+        protected = connection.execute(
+            f"SELECT COUNT(DISTINCT digest) AS n FROM candidate_dependencies "
+            f"WHERE digest IN ({marks})", tuple(digests),
+        ).fetchone()["n"]
+        return protected >= len(digests)
 
     def _check_incidents(self, connection, row, digests: set[str]) -> None:
         incidents = [item for item in damage(connection, row["collection"], row["number"])
@@ -124,6 +138,52 @@ class Delivery:
             if first < last:
                 spool.write(block[first - offset:last - offset])
             offset = block_end
+
+    def candidate_file(self, candidate: str, path: str, byte_range: str | None = None) -> Checkout:
+        """核对并送出候选完整清单中的文件，供档案员复核晚到来源。"""
+        from strata.collab.candidates import candidate_row
+
+        archive_path(path)
+        spool = SpooledTemporaryFile(max_size=SPOOL_LIMIT, dir=self.scratch)
+        failure = None
+        try:
+            with self.db.transaction() as connection:
+                now = self.db.now()
+                row = candidate_row(connection, candidate)
+                manifest = parse_stored(row["manifest"], row["manifest_hash"])
+                entry = manifest.file(path)
+                if entry is None:
+                    raise missing("candidate file", path)
+                span = span_for(byte_range, entry.size)
+                digests = {part.digest for part in entry.parts}
+                damaged = []
+                if digests:
+                    marks = ",".join("?" for _ in digests)
+                    damaged = connection.execute(
+                        f"""SELECT i.id,i.digest,i.reason FROM incidents i
+                           WHERE i.resolved_at IS NULL AND i.digest IN ({marks})""",
+                        tuple(digests),
+                    ).fetchall()
+                if damaged:
+                    raise conflict("Requested bytes depend on a damaged object",
+                                   incidents=[dict(item) for item in damaged])
+                try:
+                    self._write_span(entry, span, spool)
+                except VaultError as error:
+                    report(connection, error, now)
+                    failure = error
+                else:
+                    for digest in digests:
+                        verified(connection, digest, now)
+                manifest_hash = row["manifest_hash"]
+            if failure is not None:
+                raise failure
+            spool.seek(0)
+            return Checkout(spool, path.rsplit("/", 1)[-1], span.length,
+                            manifest_hash, entry.digest, span)
+        except BaseException:
+            spool.close()
+            raise
 
     def package(self, collection: str, number: int) -> Checkout:
         spool = SpooledTemporaryFile(max_size=SPOOL_LIMIT, dir=self.scratch)

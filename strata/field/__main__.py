@@ -36,6 +36,13 @@ def parser() -> argparse.ArgumentParser:
     submit.add_argument("--vault-url", required=True)
     submit.add_argument("--maximum-parts", type=int)
     submit.add_argument("--keep-open", action="store_true")
+    submit.add_argument("--as-candidate", action="store_true",
+                        help="Register as an independent correction candidate instead of a linear deposit")
+    submit.add_argument("--changes-file", type=Path,
+                        help="JSON list of explicit change records, e.g. "
+                             "[{\"op\":\"move\",\"from\":\"old\",\"to\":\"new\"}]")
+    submit.add_argument("--publish-merge", action="store_true",
+                        help="For a clean candidate, publish the combined edition after upload")
 
     receive = commands.add_parser("verify", help="Check a checkout against a known archival reference")
     receive.add_argument("package", type=Path)
@@ -60,7 +67,16 @@ def execute(options) -> dict:
     if options.command == "submit":
         parcel = open_parcel(options.parcel)
         with Client(options.vault_url) as endpoint:
-            return Uplink(endpoint).send(parcel, publish=not options.keep_open,
+            uplink = Uplink(endpoint)
+            if options.as_candidate:
+                changes = None
+                if options.changes_file is not None:
+                    from strata.runtime.jsonwire import read_json
+                    changes = read_json(options.changes_file.read_bytes())
+                return uplink.send_candidate(
+                    parcel, changes=changes, maximum_parts=options.maximum_parts,
+                    publish_merge=options.publish_merge).as_dict()
+            return uplink.send(parcel, publish=not options.keep_open,
                                          maximum_parts=options.maximum_parts).as_dict()
     return verify_package(
         options.package, expected_manifest=options.manifest_sha256,

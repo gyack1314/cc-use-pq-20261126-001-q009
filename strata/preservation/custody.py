@@ -19,6 +19,8 @@ UNREFERENCED = """
         WHERE p.digest=o.digest AND r.retired_at IS NULL
     )
     AND NOT EXISTS (SELECT 1 FROM received_parts p WHERE p.digest=o.digest)
+    AND NOT EXISTS (SELECT 1 FROM candidate_received_parts p WHERE p.digest=o.digest)
+    AND NOT EXISTS (SELECT 1 FROM candidate_dependencies d WHERE d.digest=o.digest)
 """
 
 

@@ -25,6 +25,8 @@ SCHEMA = (
         parent INTEGER NOT NULL,
         manifest TEXT NOT NULL,
         manifest_hash TEXT NOT NULL,
+        changes TEXT,
+        changes_hash TEXT,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('open','published','canceled','expired')),
@@ -69,6 +71,9 @@ SCHEMA = (
         parent INTEGER NOT NULL,
         manifest_hash TEXT NOT NULL,
         manifest TEXT NOT NULL,
+        changes TEXT,
+        changes_hash TEXT,
+        merge_candidate TEXT,
         published_at INTEGER NOT NULL,
         retain_until INTEGER NOT NULL,
         retired_at INTEGER,
@@ -123,6 +128,92 @@ SCHEMA = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS events_by_collection ON events(collection,id)",
+    """
+    CREATE TABLE IF NOT EXISTS candidates(
+        id TEXT PRIMARY KEY,
+        collection TEXT NOT NULL REFERENCES collections(name),
+        token TEXT NOT NULL,
+        base_revision INTEGER NOT NULL,
+        manifest TEXT NOT NULL,
+        manifest_hash TEXT NOT NULL,
+        changes TEXT NOT NULL,
+        changes_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        status TEXT NOT NULL
+            CHECK(status IN ('open','published','revoked','expired','closed')),
+        published_revision INTEGER,
+        concluded_at INTEGER,
+        UNIQUE(collection,token),
+        CHECK((status = 'published') = (published_revision IS NOT NULL))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS candidate_expected_parts(
+        candidate TEXT NOT NULL REFERENCES candidates(id),
+        digest TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        PRIMARY KEY(candidate,digest)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS candidate_received_parts(
+        candidate TEXT NOT NULL,
+        digest TEXT NOT NULL REFERENCES objects(digest),
+        received_at INTEGER NOT NULL,
+        PRIMARY KEY(candidate,digest),
+        FOREIGN KEY(candidate,digest)
+            REFERENCES candidate_expected_parts(candidate,digest)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS candidate_dependencies(
+        candidate TEXT NOT NULL REFERENCES candidates(id),
+        digest TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        PRIMARY KEY(candidate,digest)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS merge_decisions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate TEXT NOT NULL REFERENCES candidates(id),
+        conflict_key TEXT NOT NULL,
+        context_hash TEXT NOT NULL,
+        conflict_hash TEXT NOT NULL,
+        choice TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        decided_at INTEGER NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS decisions_by_candidate ON merge_decisions(candidate,id)",
+    """
+    CREATE TABLE IF NOT EXISTS merges(
+        candidate TEXT PRIMARY KEY REFERENCES candidates(id),
+        collection TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        merge_deposit TEXT NOT NULL REFERENCES deposits(id),
+        base_revision INTEGER NOT NULL,
+        base_manifest_hash TEXT NOT NULL,
+        head_revision INTEGER NOT NULL,
+        head_manifest_hash TEXT NOT NULL,
+        manifest_hash TEXT NOT NULL,
+        context_hash TEXT NOT NULL,
+        decisions TEXT NOT NULL,
+        published_at INTEGER NOT NULL,
+        UNIQUE(collection,revision)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS candidate_expiry ON candidates(status,expires_at,id)",
+)
+
+MIGRATION_V2 = tuple(
+    statement for statement in SCHEMA
+    if any(key in statement for key in (
+        "candidates", "candidate_expected_parts", "candidate_received_parts",
+        "candidate_dependencies", "merge_decisions", "decisions_by_candidate",
+        "CREATE TABLE IF NOT EXISTS merges", "candidate_expiry",
+    ))
 )
 
 
@@ -133,12 +224,30 @@ class Database:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.transaction() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError(f"Unsupported vault catalog version {version}")
             if version == 0:
                 for statement in SCHEMA:
                     connection.execute(statement)
-                connection.execute("PRAGMA user_version=1")
+                connection.execute("PRAGMA user_version=2")
+            elif version == 1:
+                self._migrate_one_to_two(connection)
+                connection.execute("PRAGMA user_version=2")
+
+    @staticmethod
+    def _migrate_one_to_two(connection: sqlite3.Connection) -> None:
+        for table, column, declaration in (
+            ("deposits", "changes", "TEXT"),
+            ("deposits", "changes_hash", "TEXT"),
+            ("revisions", "changes", "TEXT"),
+            ("revisions", "changes_hash", "TEXT"),
+            ("revisions", "merge_candidate", "TEXT"),
+        ):
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        for statement in MIGRATION_V2:
+            connection.execute(statement)
 
     def now(self) -> int:
         return self.clock()

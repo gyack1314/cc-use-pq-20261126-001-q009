@@ -69,12 +69,16 @@ class Deposits:
         self.db = db
         self.media = media
 
-    def open(self, collection: str, token: str, parent: int, lifetime: int, raw: object) -> dict:
+    def open(self, collection: str, token: str, parent: int, lifetime: int, raw: object,
+             changes: object = None, *, moves: object = None, operations: object = None) -> dict:
         collection_id(collection)
         reference_id(token, "source token")
         integer(parent, 0, 2**63 - 1, "parent revision")
         integer(lifetime, 60, 30 * DAY, "deposit lifetime")
         manifest = parse_manifest(raw)
+        from strata.collab.changes import parse_changes
+        change_set = parse_changes(changes if changes is not None else
+                                   (moves if moves is not None else operations))
         fingerprint = manifest.fingerprint()
         with self.db.transaction() as connection:
             now = self.db.now()
@@ -82,18 +86,23 @@ class Deposits:
             previous = connection.execute(
                 "SELECT * FROM deposits WHERE collection=? AND token=?", (collection, token),
             ).fetchone()
+            stored_changes_hash = change_set.fingerprint() if change_set.records else None
             if previous is not None:
                 if (previous["manifest_hash"] != fingerprint or previous["parent"] != parent
-                        or previous["expires_at"] - previous["created_at"] != lifetime):
+                        or previous["expires_at"] - previous["created_at"] != lifetime
+                        or previous["changes_hash"] != stored_changes_hash):
                     raise conflict("Source token was used for another deposit", token=token)
                 return summary(connection, previous, now)
             if current["head"] != parent:
                 raise conflict("Deposit parent differs from current head", current=current["head"], parent=parent)
             deposit = uuid4().hex
             connection.execute(
-                """INSERT INTO deposits(id,collection,token,parent,manifest,manifest_hash,created_at,expires_at,status)
-                   VALUES(?,?,?,?,?,?,?,?,'open')""",
-                (deposit, collection, token, parent, manifest.text(), fingerprint, now, now + lifetime),
+                """INSERT INTO deposits(id,collection,token,parent,manifest,manifest_hash,
+                   changes,changes_hash,created_at,expires_at,status)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,'open')""",
+                (deposit, collection, token, parent, manifest.text(), fingerprint,
+                 change_set.text() if change_set.records else None,
+                 stored_changes_hash, now, now + lifetime),
             )
             parts = manifest.unique_parts()
             connection.executemany("INSERT INTO expected_parts(deposit,digest,size) VALUES(?,?,?)",
